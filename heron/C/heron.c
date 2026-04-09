@@ -30,7 +30,6 @@ static inline double _abs(double n) {
 }
 
 uint8_t ram_block[128];
-void *ram = (void *)ram_block;
 #define GUESS    *(double *)((char *)ram + 0)
 #define LEN      *(int *)((char *)ram + 8)
 #define PRINT_BUF ((char *)ram + 12)
@@ -69,6 +68,7 @@ static inline int double_to_str(double n, char *buf) {
 
 #define TARGET 2
 void _start() {
+void *ram = (void *)ram_block;
   GUESS = TARGET / 2.0;
 LOOP:
   GUESS = (GUESS + TARGET / GUESS) / 2.0;
