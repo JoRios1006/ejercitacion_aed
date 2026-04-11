@@ -1,6 +1,8 @@
 #define SYS_WRITE 1
 #define SYS_EXIT 60
 #define STDOUT 1
+#define TARGET 2.0
+#define EPSILON 0.000000000000001
 typedef unsigned u;
 typedef unsigned long uL;
 typedef unsigned char uC;
@@ -20,6 +22,15 @@ static inline void sys_exit(void) {
                "mov $0, %%rdi\n"
                "syscall" ::"i"(SYS_EXIT)
                : "rax", "rdi");
+}
+static inline double _abs(double n) {
+  union {
+    double d;
+    unsigned long u;
+  } c;
+  c.d = n;
+  c.u &= 0x7FFFFFFFFFFFFFFF;
+  return c.d;
 }
 #define STACK(type, offset)                                                    \
   (*(type *)((char *)__builtin_frame_address(0) - (offset)))
@@ -67,8 +78,8 @@ void _start() {
   GUESS = 1.0;
 
 CONVERGE:
-  GUESS = (GUESS + 2.0 / GUESS) * 0.5;
-  if (GUESS * GUESS - 2.0 > 0.000000000000001)
+  GUESS = (GUESS + TARGET / GUESS) * 0.5;
+  if (_abs((TARGET / GUESS) - GUESS) > EPSILON * 2)
     goto CONVERGE;
 
   char *p = &STACK(char, 120);
