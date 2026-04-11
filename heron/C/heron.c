@@ -1,8 +1,6 @@
 #define SYS_WRITE 1
 #define SYS_EXIT 60
 #define STDOUT 1
-#define EPSILON 0.000000000000001
-#define TARGET 2.0
 typedef unsigned u;
 typedef unsigned long uL;
 typedef unsigned char uC;
@@ -23,16 +21,12 @@ static inline void sys_exit(void) {
                "syscall" ::"i"(SYS_EXIT)
                : "rax", "rdi");
 }
+#define STACK(type, offset)                                                    \
+  (*(type *)((char *)__builtin_frame_address(0) - (offset)))
+#define GUESS STACK(double, 128)
+#define IDX STACK(int, 120)
+#define BUF STACK(char *, 116)
 
-static inline double _abs(double n) {
-  union {
-    double d;
-    uL u;
-  } c;
-  c.d = n;
-  c.u &= 0x7FFFFFFFFFFFFFFF;
-  return c.d;
-}
 static inline int dtoa(double x, char *out) {
   struct {
     u hi : 4, lo : 4, wr : 1;
@@ -42,60 +36,50 @@ static inline int dtoa(double x, char *out) {
     *out++ = '-';
   if (x < 0)
     x = -x;
-
-  uL i = (uL)x;
-  double f = x - (double)i;
-
+  uL i = x;
+  double f = x - i;
   uC bcd[10];
   asm volatile("fildq %1\nfbstp %0\n" : "=m"(bcd) : "m"(i));
-
-  int b = 8;
+  IDX = 8;
 UNPACK_NIBBLES:
-  n.hi = (bcd[b] >> 4) & 0xF;
-  n.lo = bcd[b] & 0xF;
-  *out = '0' + n.hi;
-  out += (n.wr |= n.hi) != 0;
-  *out = '0' + n.lo;
-  out += ((n.wr |= n.lo) != 0 & b > 0) | (b == 0);
-  b--;
-  if (b >= 0)
+  n.hi = (bcd[IDX] >> 4) & 0xF;
+  n.lo = bcd[IDX] & 0xF;
+  out += (n.wr |= !!n.hi, *out = '0' + n.hi, n.wr);
+  out += (n.wr |= !!n.lo, *out = '0' + n.lo, n.wr && IDX > 0 || IDX == 0);
+  if (--IDX >= 0)
     goto UNPACK_NIBBLES;
+
   *out++ = '.';
-  int d = 0;
+  IDX = 0;
   int digit;
 GENERATE_DECIMALS:
-  f *= (int) 10;
+  f *= 10;
   digit = f;
   *out++ = '0' + digit;
   f -= digit;
-  d++;
-  if (d < 15)
+  if (IDX++ < 15)
     goto GENERATE_DECIMALS;
+
   return out - start;
 }
 
-#define GUESS (*(double *)((char *)__builtin_frame_address(0) - 128))
-#define BUF ((char *)__builtin_frame_address(0) - 120)
-
 void _start() {
-  GUESS = TARGET / 2.0;
+  GUESS = 1.0;
 
 CONVERGE:
-  GUESS = (GUESS + TARGET / GUESS) * 0.5;
-  if (_abs((TARGET / GUESS) - GUESS) > EPSILON * 2)
+  GUESS = (GUESS + 2.0 / GUESS) * 0.5;
+  if (GUESS * GUESS - 2.0 > 0.000000000000001)
     goto CONVERGE;
 
-PRINT: {
-  char *p = BUF;
-  __builtin_memcpy(p, "ROOT OF ", 8);
+  char *p = &STACK(char, 120);
+  *(long *)p = 0x20464f20544f4f52LL;
   p += 8;
-  p += dtoa(TARGET, p);
-  __builtin_memcpy(p, "  ", 2);
+  p += dtoa(2.0, p);
+  *(short *)p = 0x2020;
   p += 2;
   p += dtoa(GUESS, p);
   *p++ = '\n';
-  sys_write(BUF, p - BUF);
-}
+  sys_write(&STACK(char, 120), p - &STACK(char, 120));
 
   sys_exit();
 }
