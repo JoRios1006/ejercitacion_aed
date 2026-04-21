@@ -11,6 +11,10 @@
 /* ═══════════════════════════════════════════════════════════════════════════
  * TINY.H — no-libc x86-64 Linux toolkit
  *
+ * Philosophy: data as truth, code as pointer arithmetic.
+ *             no branches where masks suffice.
+ *             no libc, no headers, no runtime.
+ *
  * Sections:
  *   1.  syscall numbers
  *   2.  alignment & pointer utils
@@ -22,8 +26,9 @@
  *   8.  integer bit ops
  *   9.  string & memory ops
  *  10.  dtoa / atof / atoi
- *  11.  I/O  (print f64, int, str, read)
+ *  11.  I/O  (print f64, int, str / read)
  *  12.  brk / slab allocator
+ *  13.  tiny_str_t  (German-style SSO string)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 
@@ -42,8 +47,8 @@ _Static_assert(STDOUT    == 1,  "fd assumption broken");
 
 
 /* ─── 2. alignment & pointer utils ──────────────────────────────────────── */
-#define ALIGN_UP(s)         (((s) + 7) & ~7)
-#define ALIGN_DOWN(s)       ((s) & ~7)
+#define ALIGN_UP(s)         (((s) + 7) & ~7)   /* round up to 8-byte boundary   */
+#define ALIGN_DOWN(s)       ((s) & ~7)          /* round down to 8-byte boundary */
 
 #define OFFSET(ptr, bytes)  ((void*)((char*)(ptr) + (bytes)))
 #define INDEX(base, i)      ((void*)((double*)(base) + (i)))
@@ -54,6 +59,7 @@ _Static_assert(STDOUT    == 1,  "fd assumption broken");
 /*
  * STACK(off) — void* to [rbp - off] in current frame.
  * REQUIRES valid frame pointer (-fno-omit-frame-pointer).
+ * Use inside non-naked fns only (naked fns have no GCC-managed frame).
  */
 #define STACK(off) ((void*)((char*)__builtin_frame_address(0) - (off)))
 
@@ -73,23 +79,23 @@ _Static_assert(STDOUT    == 1,  "fd assumption broken");
 
 /* ─── 4. xmm scalar f64 arithmetic ──────────────────────────────────────── */
 /*
- * All ops take void* addresses pointing to doubles.
- * DEF  — *addr  = literal
+ * All ops take void* addresses pointing to doubles on the stack/heap.
+ * DEF  — *addr  = literal double
  * COPY — *dst   = *src
- * SWAP — swap *a, *b            (xmm0/xmm1, no temp on stack)
+ * SWAP — swap *a <-> *b           (xmm0/xmm1, no stack temp)
  * INC  — *addr += 1.0
  * DEC  — *addr -= 1.0
  * SUM  — *out   = *a + *b
  * SUB  — *out   = *a - *b
  * MUL  — *out   = *a * *b
  * DIV  — *out   = *a / *b
- * MOD  — *out   = fmod(*a,*b)   (x87 fprem1, no libm)
- * ROOT — *out   = sqrt(*a)
- * ABS  — *out   = |*a|          (andpd sign mask, branchless)
- * NEG  — *out   = -*a           (xorpd sign mask, branchless)
- * MIN  — *out   = min(*a,*b)    (minsd)
- * MAX  — *out   = max(*a,*b)    (maxsd)
- * AVG  — *out   = (*a+*b)*0.5   (no overflow risk)
+ * MOD  — *out   = fmod(*a, *b)    (x87 fprem1, no libm)
+ * ROOT — *out   = sqrt(*a)        (sqrtsd)
+ * ABS  — *out   = |*a|            (andpd sign mask, branchless)
+ * NEG  — *out   = -*a             (xorpd sign mask, branchless)
+ * MIN  — *out   = min(*a, *b)     (minsd)
+ * MAX  — *out   = max(*a, *b)     (maxsd)
+ * AVG  — *out   = (*a + *b) * 0.5 (xmm, no overflow)
  */
 #define DEF(addr, val) ({                                                      \
     double _v = (val);                                                         \
@@ -165,7 +171,7 @@ _Static_assert(STDOUT    == 1,  "fd assumption broken");
         :: "r"(out), "r"(a), "r"(b) : "xmm0", "memory");                      \
 })
 
-/* MOD via x87 fprem1 — loops until C2 clears (partial remainder done) */
+/* MOD via x87 fprem1 — iterates until C2 flag clears (full remainder done) */
 #define MOD(out, a, b) ({                                                      \
     asm volatile(                                                              \
         "fldl   (%2)\n"                                                        \
@@ -186,21 +192,23 @@ _Static_assert(STDOUT    == 1,  "fd assumption broken");
         :: "r"(out), "r"(a) : "xmm0", "memory");                              \
 })
 
+/* ABS: clear IEEE 754 sign bit via andpd with 0x7FFFFFFFFFFFFFFF mask */
 #define ABS(out, a) ({                                                         \
     static const long long _absmask = 0x7FFFFFFFFFFFFFFFLL;                   \
     asm volatile(                                                              \
-        "movsd (%1),   %%xmm0\n"                                               \
-        "andpd (%2),   %%xmm0\n"                                               \
-        "movsd %%xmm0, (%0)"                                                   \
+        "movsd  (%1),   %%xmm0\n"                                              \
+        "andpd  (%2),   %%xmm0\n"                                              \
+        "movsd  %%xmm0, (%0)"                                                  \
         :: "r"(out), "r"(a), "r"(&_absmask) : "xmm0", "memory");              \
 })
 
+/* NEG: flip IEEE 754 sign bit via xorpd with 0x8000000000000000 mask */
 #define NEG(out, a) ({                                                         \
     static const long long _negmask = (long long)0x8000000000000000LL;        \
     asm volatile(                                                              \
-        "movsd (%1),   %%xmm0\n"                                               \
-        "xorpd (%2),   %%xmm0\n"                                               \
-        "movsd %%xmm0, (%0)"                                                   \
+        "movsd  (%1),   %%xmm0\n"                                              \
+        "xorpd  (%2),   %%xmm0\n"                                              \
+        "movsd  %%xmm0, (%0)"                                                  \
         :: "r"(out), "r"(a), "r"(&_negmask) : "xmm0", "memory");              \
 })
 
@@ -231,11 +239,18 @@ _Static_assert(STDOUT    == 1,  "fd assumption broken");
 })
 
 
-/* ─── 5. f64 comparisons → double flag ──────────────────────────────────── */
+/* ─── 5. f64 comparisons -> double flag ─────────────────────────────────── */
 /*
- * Stores 1.0 (true) or 0.0 (false) at out. NaN → false (ucomisd).
- * IS_GT / IS_LT / IS_GE / IS_LE / IS_EQ / IS_NE
- * CMP  — stores -1.0 / 0.0 / 1.0  (less / equal / greater)
+ * Each macro stores 1.0 (true) or 0.0 (false) at out.
+ * Uses ucomisd — NaN-safe (NaN comparisons always yield false).
+ *
+ * IS_GT(out,a,b) — *a >  *b
+ * IS_LT(out,a,b) — *a <  *b
+ * IS_GE(out,a,b) — *a >= *b
+ * IS_LE(out,a,b) — *a <= *b
+ * IS_EQ(out,a,b) — *a == *b
+ * IS_NE(out,a,b) — *a != *b
+ * CMP(out,a,b)   — -1.0 / 0.0 / 1.0  (less / equal / greater)
  */
 #define _CMP_IMPL(out, a, b, setcc) ({                                         \
     static const double _t = 1.0, _f = 0.0;                                   \
@@ -260,6 +275,7 @@ _Static_assert(STDOUT    == 1,  "fd assumption broken");
 #define IS_EQ(out, a, b)  _CMP_IMPL(out, a, b, "sete")
 #define IS_NE(out, a, b)  _CMP_IMPL(out, a, b, "setne")
 
+/* CMP: stores -1.0 / 0.0 / 1.0 — useful as sort comparator */
 #define CMP(out, a, b) ({                                                      \
     static const double _neg = -1.0, _zer = 0.0, _pos = 1.0;                  \
     asm volatile(                                                              \
@@ -280,16 +296,30 @@ _Static_assert(STDOUT    == 1,  "fd assumption broken");
 
 /* ─── 6. f64 control flow ────────────────────────────────────────────────── */
 /*
- * FOR_RANGE(idx_addr, start, end)  — forward, INC each iteration
- * FOR_DOWN(idx_addr, start, end)   — reverse, DEC each iteration
- * WHILE_NZ(flag_addr)              — loop while *flag != 0.0
- * IF_GT/LT/GE/LE/EQ/NE(a,b)       — conditional block on two addrs
+ * FOR_RANGE(idx_addr, start, end)
+ *   — idx_addr: void* to a double on the stack used as loop counter
+ *   — iterates while *idx < end, INC each iteration
+ *   — use: FOR_RANGE(STACK(8), 0.0, 10.0) { ... }
+ *
+ * FOR_DOWN(idx_addr, start, end)
+ *   — iterates while *idx > end, DEC each iteration
+ *
+ * WHILE_NZ(flag_addr)
+ *   — loops while *(double*)flag_addr != 0.0
+ *   — set to 0.0 inside body to exit
+ *
+ * IF_GT/LT/GE/LE/EQ/NE(a, b) { ... }
+ *   — conditional block on two void* addr values via DEREF
  */
 #define FOR_RANGE(idx_addr, start, end) \
-    for (DEF((idx_addr),(start)); DEREF(idx_addr) < (end); INC(idx_addr))
+    for (DEF((idx_addr), (start));      \
+         DEREF(idx_addr) < (end);       \
+         INC(idx_addr))
 
 #define FOR_DOWN(idx_addr, start, end)  \
-    for (DEF((idx_addr),(start)); DEREF(idx_addr) > (end); DEC(idx_addr))
+    for (DEF((idx_addr), (start));      \
+         DEREF(idx_addr) > (end);       \
+         DEC(idx_addr))
 
 #define WHILE_NZ(flag_addr) \
     while (DEREF(flag_addr) != 0.0)
@@ -304,170 +334,171 @@ _Static_assert(STDOUT    == 1,  "fd assumption broken");
 
 /* ─── 7. f64 array helpers ───────────────────────────────────────────────── */
 /*
- * FILL(base, count, val)    — set count doubles to val
- * ZERO(addr)                — zero one double slot
- * ARRAY_GET(base, i, dst)   — dst  = base[i]
- * ARRAY_SET(base, i, src)   — base[i] = src
- *
- * NTH(arr, idx, len)
- *   Bounds-checked pointer lookup for any pointer array (const char*[], etc).
- *   Returns arr[idx] if 0 <= idx < len, NULL otherwise.
- *   NULL = explicit sentinel meaning "not a valid index".
- *   0 is a valid index — never used as sentinel here.
- *   Unsigned cast on idx kills negative indices for free (wrap → huge → OOB).
- *
- * find_if(base, count, stride, pred)
- *   Linear scan. Returns void* to first element where pred(ptr) != 0, or NULL.
- *   Define pred as: static inline int my_pred(void *p) { ... }
+ * FILL(base, count, val) — set count doubles starting at base to val
+ * ZERO(addr)             — zero one double slot
+ * ARRAY_GET(base,i,dst)  — dst = base[i]
+ * ARRAY_SET(base,i,src)  — base[i] = src
  */
 #define FILL(base, count, val) ({                                              \
-    double  _fv = (val);                                                       \
+    double  _fv = (double)(val);                                               \
     double *_fp = (double*)(base);                                             \
     for (long _fi = 0; _fi < (long)(count); _fi++) _fp[_fi] = _fv;            \
 })
 
-#define ZERO(addr) DEF((addr), 0.0)
-
-#define ARRAY_GET(base, i, dst) \
-    COPY((dst), INDEX((base), (i)))
-
-#define ARRAY_SET(base, i, src) \
-    COPY(INDEX((base), (i)), (src))
-
-#define NTH(arr, idx, len) \
-    ((unsigned long)(idx) < (unsigned long)(len) ? (arr)[(idx)] : (void*)0)
-
-static inline void *find_if(void *base, long count, long stride,
-                             int (*pred)(void *)) {
-    char *p = (char *)base;
-    for (long i = 0; i < count; i++, p += stride)
-        if (pred((void *)p)) return (void *)p;
-    return (void *)0;
-}
+#define ZERO(addr)              DEF((addr), 0.0)
+#define ARRAY_GET(base, i, dst) COPY((dst),            INDEX((base), (i)))
+#define ARRAY_SET(base, i, src) COPY(INDEX((base),(i)), (src))
 
 
 /* ─── 8. integer bit ops ─────────────────────────────────────────────────── */
 /*
- * Pure integer / bitwise. Operate on unsigned long / long unless noted.
- * Techniques from: Bit Twiddling Hacks — Sean Eron Anderson, Stanford.
- *                  (individual snippets are public domain)
+ * All operate on unsigned long (64-bit) unless noted.
+ * Branchless where possible — masks, not jumps.
  *
- * IS_POW2(v)        — 1 if v is a power of 2 (v > 0)
- * IS_OPP_SIGN(x,y)  — 1 if x and y have opposite signs
- * SIGN(v)           — -1, 0, or +1
- * IABS(v)           — |v| without branch  (signed long)
- * IMIN(x,y)         — branchless min      (signed long)
- * IMAX(x,y)         — branchless max      (signed long)
- * IAVG(x,y)         — (x+y)/2 no overflow: (x&y)+((x^y)>>1)
- * MERGE(a,b,mask)   — bits from b where mask=1, from a where mask=0
- * NEXT_POW2(v)      — next power of 2, 32-bit unsigned
- * POPCOUNT(v)       — set bit count, 32-bit (parallel Hamming weight)
- * TRAILING_ZEROS(v) — trailing zero count, 32-bit (DeBruijn multiply)
+ * IABS(x)          — |x|, no branch. mask = x>>63; (x+mask)^mask
+ * IMIN(x,y)        — branchless min
+ * IMAX(x,y)        — branchless max
+ * IAVG(x,y)        — (x&y)+((x^y)>>1), no overflow
+ * IS_POW2(x)       — 1 if x is power of 2 (x > 0 required)
+ * IS_OPP_SIGN(x,y) — 1 if x and y have opposite signs
+ * NEXT_POW2(v)     — next power of 2 >= v (32-bit)
+ * POPCOUNT(v)      — count set bits, parallel method (32-bit, 12 ops)
+ * TRAILING_ZEROS(v)— trailing zero count, DeBruijn multiply (32-bit, 4 ops)
+ * MERGE(a,b,mask)  — (a&~mask)|(b&mask), branchless bit-select
+ * BIT_SET(x,n)     — set bit n
+ * BIT_CLR(x,n)     — clear bit n
+ * BIT_TST(x,n)     — test bit n (nonzero if set)
+ * BIT_FLP(x,n)     — flip bit n
+ * COND_SET(w,m,f)  — if f: w|=m else w&=~m, branchless
  */
+#define IABS(x)           ({ long _x=(long)(x); long _m=_x>>63; (_x+_m)^_m; })
+#define IMIN(x,y)         ({ long _x=(long)(x),_y=(long)(y); _y^((_x^_y)&-((_x)<(_y))); })
+#define IMAX(x,y)         ({ long _x=(long)(x),_y=(long)(y); _x^((_x^_y)&-((_x)<(_y))); })
+#define IAVG(x,y)         ({ unsigned long _x=(x),_y=(y); (_x&_y)+((_x^_y)>>1); })
+#define IS_POW2(x)        ({ unsigned long _x=(x); (_x && !(_x&(_x-1))); })
+#define IS_OPP_SIGN(x,y)  (((long)(x)^(long)(y)) < 0)
+#define MERGE(a,b,mask)   ((a)^(((a)^(b))&(mask)))
+#define BIT_SET(x,n)      ((x) |=  (1UL<<(n)))
+#define BIT_CLR(x,n)      ((x) &= ~(1UL<<(n)))
+#define BIT_TST(x,n)      ((x) &   (1UL<<(n)))
+#define BIT_FLP(x,n)      ((x) ^=  (1UL<<(n)))
+#define COND_SET(w,m,f)   ((w) = ((w)&~(m))|(-(unsigned long)(f)&(m)))
 
-#define IS_POW2(v)        ((unsigned long)(v) && !((v) & ((v) - 1)))
-#define IS_OPP_SIGN(x,y)  (((long)(x) ^ (long)(y)) < 0)
-#define SIGN(v)           (((long)(v) > 0L) - ((long)(v) < 0L))
-
-#define IABS(v) ({                                                             \
-    long _v = (v);                                                             \
-    long _m = _v >> (sizeof(long)*8 - 1);                                     \
-    (_v + _m) ^ _m;                                                            \
-})
-
-#define IMIN(x,y) ({                                                           \
-    long _x = (x), _y = (y);                                                  \
-    _y ^ ((_x ^ _y) & -((_x) < (_y)));                                        \
-})
-
-#define IMAX(x,y) ({                                                           \
-    long _x = (x), _y = (y);                                                  \
-    _x ^ ((_x ^ _y) & -((_x) < (_y)));                                        \
-})
-
-/* overflow-safe: no intermediate x+y */
-#define IAVG(x,y)         (((x) & (y)) + (((x) ^ (y)) >> 1))
-
-/* branchless bit-select: bits from b where mask=1, a where mask=0 */
-#define MERGE(a, b, mask) ((a) ^ (((a) ^ (b)) & (mask)))
-
-/* round up to next power of 2, 32-bit; 0→0, pow2→same */
+/* NEXT_POW2 — round 32-bit v up to next power of 2 (0 stays 0) */
 #define NEXT_POW2(v) ({                                                        \
-    unsigned int _v = (unsigned int)(v) - 1;                                  \
-    _v |= _v >> 1;  _v |= _v >> 2;                                            \
-    _v |= _v >> 4;  _v |= _v >> 8;                                            \
-    _v |= _v >> 16; _v + 1;                                                    \
+    unsigned int _v = (unsigned int)(v);                                       \
+    _v--; _v|=_v>>1; _v|=_v>>2; _v|=_v>>4; _v|=_v>>8; _v|=_v>>16; _v++;     \
+    _v;                                                                        \
 })
 
-/* parallel popcount, 32-bit */
+/*
+ * POPCOUNT — parallel Hamming weight, 32-bit.
+ * 12 ops, no table, no 64-bit multiply needed.
+ */
 #define POPCOUNT(v) ({                                                         \
-    unsigned int _v = (unsigned int)(v);                                      \
-    _v = _v - ((_v >> 1) & 0x55555555u);                                      \
-    _v = (_v & 0x33333333u) + ((_v >> 2) & 0x33333333u);                      \
-    (int)(((_v + (_v >> 4) & 0x0F0F0F0Fu) * 0x01010101u) >> 24);              \
+    unsigned int _v = (unsigned int)(v);                                       \
+    _v  = _v - ((_v >> 1) & 0x55555555U);                                     \
+    _v  = (_v & 0x33333333U) + ((_v >> 2) & 0x33333333U);                     \
+    _v  = ((_v + (_v >> 4)) & 0x0F0F0F0FU);                                   \
+    (int)((_v * 0x01010101U) >> 24);                                           \
 })
 
-/* DeBruijn trailing zeros, 32-bit — static table, one multiply */
-static const int _tiny_debruijn_tz[32] = {
-     0,  1, 28,  2, 29, 14, 24,  3, 30, 22, 20, 15, 25, 17,  4,  8,
-    31, 27, 13, 23, 21, 19, 16,  7, 26, 12, 18,  6, 11,  5, 10,  9
-};
-#define TRAILING_ZEROS(v) \
-    _tiny_debruijn_tz[((unsigned int)((v) & -(v)) * 0x077CB531u) >> 27]
+/*
+ * TRAILING_ZEROS — count trailing zero bits, 32-bit.
+ * DeBruijn multiply + lookup: 4 ops, no branch.
+ * Returns 32 if v == 0.
+ */
+#define TRAILING_ZEROS(v) ({                                                   \
+    static const int _db32[32] = {                                             \
+         0, 1,28, 2,29,14,24, 3,30,22,20,15,25,17, 4, 8,                      \
+        31,27,13,23,21,19,16, 7,26,12,18, 6,11, 5,10, 9                        \
+    };                                                                         \
+    unsigned int _v = (unsigned int)(v);                                       \
+    _v ? _db32[((unsigned int)((_v & -_v) * 0x077CB531U)) >> 27] : 32;        \
+})
 
 
 /* ─── 9. string & memory ops ─────────────────────────────────────────────── */
 /*
- * STRLEN(s)           — length via repne scasb. Does NOT count NUL. O(n).
- * MEM_COPY(dst,src,n) — copy n bytes via rep movsb.
- * MEM_ZERO(dst,n)     — zero n bytes via rep stosb.
+ * STRLEN(s)
+ *   — length of NUL-terminated string via repne scasb.
+ *     One asm instruction, no C loop.
+ *
+ * MEM_COPY(dst, src, n)
+ *   — copy n bytes via rep movsb.
+ *     No alignment requirement. Use to move data between STACK and slab.
+ *
+ * NTH(arr, idx, len)
+ *   — safe indexed access into any pointer array (char**, void**, etc.)
+ *   — returns arr[idx] if 0 <= idx < len, else NULL.
+ *   — NULL = explicit "no value" sentinel. 0 is a valid index, NULL is not.
+ *   — unsigned cast trick: negative idx wraps to huge value -> OOB -> NULL.
+ *     Single comparison, no branch at call site with -O2.
+ *
+ * FIND_IF(base, count, stride, pred)
+ *   — linear scan. Returns void* to first element where pred(ptr) != 0.
+ *   — Returns NULL if not found.
+ *   — stride = sizeof(element), pred = int(*)(void*)
+ *
+ * Example — day lookup (your Python one-liner, in C, no libc):
+ *
+ *   static const char *_semana[] = {
+ *       "LUNES","MARTES","MIERCOLES","JUEVES","VIERNES","SABADO","DOMINGO"
+ *   };
+ *   char buf[16]; READ(buf, sizeof(buf));
+ *   long n         = tiny_atoi(buf, NULL) - 1;
+ *   const char *dia = NTH(_semana, n, 7);
+ *   if (dia) PRINTLN_STR(dia, STRLEN(dia));
+ *   else     PRINTLN_STR("ERROR", 5);
  */
 
-/*
- * repne scasb scans [rdi] while != al, decrementing rcx.
- * Start rcx=-1 (unlimited). After: rcx = -(len+2).
- * ~rcx = len+1, subtract 1 → len.
- */
-#define STRLEN(s) ({                                                           \
-    const char *_s = (s);                                                      \
-    long _len;                                                                 \
-    asm volatile(                                                              \
-        "cld\n"                                                                \
-        "repne scasb"                                                          \
-        : "=c"(_len), "+D"(_s)                                                 \
-        : "0"(-1L), "a"(0)                                                     \
-        : "memory");                                                           \
-    ~_len - 1L;                                                                \
-})
+static inline long tiny_strlen(const char *s) {
+    long len;
+    asm volatile(
+        "cld\n"
+        "xorb  %%al,  %%al\n"      /* search for NUL */
+        "movq  $-1,   %%rcx\n"     /* max scan length */
+        "repne scasb\n"            /* scan until [rdi] == 0 */
+        "notq  %%rcx\n"
+        "decq  %%rcx"              /* rcx = length excluding NUL */
+        : "=c"(len)
+        : "D"(s)
+        : "rax", "memory");
+    return len;
+}
+#define STRLEN(s) tiny_strlen(s)
 
-#define MEM_COPY(dst, src, n) ({                                               \
-    void *_d = (dst); const void *_s = (src); long _n = (n);                  \
-    asm volatile(                                                              \
-        "cld\n"                                                                \
-        "rep movsb"                                                            \
-        : "+D"(_d), "+S"(_s), "+c"(_n)                                         \
-        :: "memory");                                                          \
-})
+static inline void tiny_memcopy(void *dst, const void *src, long n) {
+    asm volatile(
+        "cld\n"
+        "rep movsb"
+        : "+D"(dst), "+S"(src), "+c"(n)
+        :: "memory");
+}
+#define MEM_COPY(dst, src, n) tiny_memcopy((dst), (src), (n))
 
-#define MEM_ZERO(dst, n) ({                                                    \
-    void *_d = (dst); long _n = (n);                                           \
-    asm volatile(                                                              \
-        "cld\n"                                                                \
-        "rep stosb"                                                            \
-        : "+D"(_d), "+c"(_n)                                                   \
-        : "a"(0)                                                               \
-        : "memory");                                                           \
-})
+#define NTH(arr, idx, len) \
+    ((unsigned long)(idx) < (unsigned long)(len) ? (arr)[(idx)] : (void*)0)
+
+static inline void *tiny_find_if(void *base, long count, long stride,
+                                  int (*pred)(void *)) {
+    char *p = (char *)base;
+    for (long i = 0; i < count; i++, p += stride)
+        if (pred(p)) return (void *)p;
+    return (void *)0;
+}
+#define FIND_IF(base, count, stride, pred) \
+    tiny_find_if((base), (count), (stride), (pred))
 
 
 /* ─── 10. dtoa / atof / atoi ─────────────────────────────────────────────── */
 /*
- * dtoa(x, out)           — double → decimal string. No NUL. Returns length.
- *                          out >= 32 bytes.
- * tiny_atof(s, end_ptr)  — decimal string → double.
- * tiny_atoi(s, end_ptr)  — decimal string → long.
- * Both skip leading whitespace and handle '-'.
- * *end_ptr set to first unparsed char (pass NULL to ignore).
+ * dtoa(x, out)          — double -> decimal string. No NUL. Returns length.
+ *                         out must be >= 32 bytes.
+ *                         Integer part via x87 fbstp (BCD). Trailing zeros stripped.
+ * tiny_atof(s, end_ptr) — decimal string -> double. Skips leading whitespace.
+ * tiny_atoi(s, end_ptr) — decimal string -> long.  Skips leading whitespace.
+ *                         Both set *end_ptr to first unparsed char (pass NULL to ignore).
  */
 static inline int dtoa(double x, char *out) {
     char *start = out;
@@ -502,10 +533,11 @@ static inline double tiny_atof(const char *s, const char **end_ptr) {
     while (*s == ' ' || *s == '\t' || *s == '\n') s++;
     if (*s == '-') { neg = 1; s++; }
     for (; *s; s++) {
-        if (*s >= '0' && *s <= '9') {
+        if      (*s >= '0' && *s <= '9') {
             if (in_frac) { frac *= 0.1; result += (*s - '0') * frac; }
             else         { result = result * 10.0 + (*s - '0'); }
-        } else if (*s == '.') { in_frac = 1; } else { break; }
+        } else if (*s == '.') { in_frac = 1; }
+        else break;
     }
     if (end_ptr) *end_ptr = s;
     return neg ? -result : result;
@@ -523,19 +555,14 @@ static inline long tiny_atoi(const char *s, const char **end_ptr) {
 
 /* ─── 11. I/O ────────────────────────────────────────────────────────────── */
 /*
- * READ(buf, len)        — read stdin → buf. Returns bytes read (int).
- * PRINT(addr)           — print *(double*)addr
- * PRINTLN(addr)         — print *(double*)addr + '\n'
- * PRINT_INT(n)          — print signed long
- * PRINTLN_INT(n)        — print signed long + '\n'
- * PRINT_STR(ptr, len)   — write raw bytes
- * PRINTLN_STR(ptr, len) — write raw bytes + '\n'
- * EXIT(code)            — _exit syscall, noreturn
- *
- * Typical pattern for string lookup:
- *   const char *day = NTH(_semana, idx, 7);
- *   if (day) PRINTLN_STR(day, STRLEN(day));
- *   else     PRINTLN_STR("ERROR", 5);
+ * READ(buf,len)          — read stdin -> buf. Returns bytes read (int).
+ * PRINT(addr)            — print *(double*)addr
+ * PRINTLN(addr)          — print *(double*)addr + newline
+ * PRINT_INT(n)           — print signed long
+ * PRINTLN_INT(n)         — print signed long + newline
+ * PRINT_STR(ptr,len)     — write raw bytes  (use STRLEN for len)
+ * PRINTLN_STR(ptr,len)   — write raw bytes + newline
+ * EXIT(code)             — _exit syscall, noreturn
  */
 #define READ(buf, len) ({                           \
     register long  _rax asm("rax") = SYS_READ;     \
@@ -568,7 +595,7 @@ static inline long tiny_atoi(const char *s, const char **end_ptr) {
 #define PRINT(addr)   _PRINT_IMPL(addr, 0)
 #define PRINTLN(addr) _PRINT_IMPL(addr, 1)
 
-/* integer → string via x87 BCD (same engine as dtoa, integer part only) */
+/* integer -> decimal via x87 BCD, same engine as dtoa, integer part only */
 static inline int _itoa(long x, char *out) {
     char *start = out;
     if (x < 0) { *out++ = '-'; x = -x; }
@@ -610,6 +637,21 @@ static inline int _itoa(long x, char *out) {
 
 
 /* ─── 12. brk / slab allocator ───────────────────────────────────────────── */
+/*
+ * tiny_brk(addr)  — raw brk syscall. Pass NULL to query current brk.
+ * BRK_GET()       — query current program break
+ * BRK_SET(addr)   — set program break
+ * tiny_sbrk(n)    — grow heap by n bytes. Returns old brk (base of new region).
+ *                   Returns (void*)-1 on failure.
+ *
+ * SlabPool — O(1) fixed-size allocator on top of brk heap.
+ *   slab_init(pool, slot_size, total_slots)
+ *     — one brk call total. slot_size clamped to sizeof(SlabSlot) min,
+ *       then ALIGN_UP'd so xmm doubles stored in slots stay aligned.
+ *     — builds free list in O(n).
+ *   slab_alloc(pool) — pop head. O(1). Returns NULL if exhausted.
+ *   slab_free(pool, ptr) — push back. O(1). No bounds check.
+ */
 static inline void *tiny_brk(void *addr) {
     register long  _rax asm("rax") = SYS_BRK;
     register void *_rdi asm("rdi") = addr;
@@ -667,3 +709,178 @@ static inline void slab_free(SlabPool *pool, void *ptr) {
     s->next         = pool->free_list;
     pool->free_list = s;
 }
+
+
+/* ─── 13. tiny_str_t  (German-style SSO string) ──────────────────────────
+ *
+ * Layout (16 bytes total, always):
+ *
+ *   Inlined  (built with S()):
+ *     [ uint32_t len (bit31=0) | char data[12] ]
+ *
+ *   Pointer  (built with S_PTR() / S_VIEW() / STR_SLICE()):
+ *     [ uint32_t len (bit31=1) | char prefix[4] | char *ptr ]
+ *       bit31 of length = HEAP flag. Real length = len & 0x7FFFFFFF.
+ *       prefix = first min(4,len) bytes, for fast EQ rejection.
+ *       ptr    = borrowed pointer, not owned.
+ *
+ * Why bit31 flag? Disambiguates inline vs heap regardless of string length.
+ *   Previous design used len<=12 as the discriminant — broken for short
+ *   heap strings (slice, S_PTR of 1-char string, etc).
+ * Why prefix? Fast rejection in STR_EQ without a cache miss on ptr.
+ * No NUL stored. Length always explicit.
+ * No alloc. No ownership. Caller manages pointer lifetime.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+#include <stdint.h>
+
+#define _TINY_STR_HEAP_FLAG  ((uint32_t)0x80000000u)
+#define _TINY_STR_LEN_MASK   ((uint32_t)0x7FFFFFFFu)
+
+typedef struct {
+    union {
+        struct {
+            uint32_t length;        /* bit31=0 → inline */
+            char     data[12];
+        } inlined;
+        struct {
+            uint32_t length;        /* bit31=1 → heap */
+            char     prefix[4];
+            char    *ptr;
+        } heap;
+    };
+} tiny_str_t;
+
+/* ── discriminant & accessors ── */
+#define STR_IS_INLINED(s)   (!((s).inlined.length & _TINY_STR_HEAP_FLAG))
+#define STR_LEN(s)          ((s).inlined.length & _TINY_STR_LEN_MASK)
+#define STR_DATA(s) \
+    (STR_IS_INLINED(s) ? (const char*)(s).inlined.data \
+                       : (const char*)(s).heap.ptr)
+
+/* ── compile-time literal constructor (inline path) ──
+ * Hard error if literal > 12 chars. Use S_PTR() for longer strings.
+ * bit31 left 0 — inline flag.
+ */
+#define S(lit) (__extension__({                                                \
+    _Static_assert(sizeof(lit)-1 <= 12,                                        \
+        "S(): literal exceeds 12 chars max inline. Use S_PTR().");             \
+    (tiny_str_t){ .inlined = {                                                 \
+        .length = (uint32_t)(sizeof(lit)-1),   /* bit31=0, always inline */    \
+        .data   = lit                                                          \
+    }};                                                                        \
+}))
+
+/* ── runtime pointer constructor (heap path) ──
+ * Sets bit31. Copies first min(len,4) bytes to prefix.
+ * Does NOT copy string data. ptr must outlive this tiny_str_t.
+ */
+static inline tiny_str_t S_PTR(const char *ptr, uint32_t len) {
+    tiny_str_t s;
+    s.heap.length = len | _TINY_STR_HEAP_FLAG;   /* set heap flag */
+    uint32_t plen = len < 4 ? len : 4;
+    for (uint32_t i = 0;    i < plen; i++) s.heap.prefix[i] = ptr[i];
+    for (uint32_t i = plen; i < 4;    i++) s.heap.prefix[i] = 0;
+    s.heap.ptr = (char *)ptr;
+    return s;
+}
+
+#define S_VIEW(ptr, len) S_PTR((ptr), (len))
+
+/* ── equality ──────────────────────────────────────────────────────────────
+ * len mismatch       → false (no data touch)
+ * prefix mismatch    → false (one uint32 load from each, no ptr deref)
+ * prefix match       → rep cmpsb on full data
+ * Copy to locals: macro args may be temporaries — &(expr) is not an lvalue.
+ */
+static inline int _tiny_str_memeq(const char *a, const char *b, long n) {
+    int result;
+    asm volatile(
+        "cld\n"
+        "repe cmpsb\n"
+        "sete %b0"
+        : "=r"(result), "+S"(a), "+D"(b), "+c"(n)
+        :: "memory");
+    return result;
+}
+
+#define STR_EQ(s1, s2) ({                                                      \
+    tiny_str_t _a = (s1), _b = (s2);                                           \
+    int _eq = 0;                                                               \
+    if (STR_LEN(_a) == STR_LEN(_b)) {                                          \
+        /* bytes [4..7] = prefix in both arms (same offset after length).     \
+           uint32 load = compare first 4 chars in one instruction. */          \
+        uint32_t _p1, _p2;                                                     \
+        __builtin_memcpy(&_p1, (const char*)&_a + 4, 4);                      \
+        __builtin_memcpy(&_p2, (const char*)&_b + 4, 4);                      \
+        if (_p1 == _p2)                                                        \
+            _eq = _tiny_str_memeq(STR_DATA(_a), STR_DATA(_b),                 \
+                                  (long)STR_LEN(_a));                          \
+    }                                                                          \
+    _eq;                                                                       \
+})
+
+/* ── compare against string literal ── */
+#define STR_EQ_LIT(s, lit) ({                                                  \
+    _Static_assert(sizeof(lit)-1 <= 12,                                        \
+        "STR_EQ_LIT: literal > 12 chars. Use S_PTR() + STR_EQ().");           \
+    uint32_t _ll = (uint32_t)(sizeof(lit)-1);                                  \
+    int _eq = 0;                                                               \
+    if (STR_LEN(s) == _ll)                                                     \
+        _eq = _tiny_str_memeq(STR_DATA(s), (lit), (long)_ll);                 \
+    _eq;                                                                       \
+})
+
+/* ── starts with literal ── */
+#define STR_STARTS_WITH(s, lit) ({                                             \
+    _Static_assert(sizeof(lit)-1 <= 12,                                        \
+        "STR_STARTS_WITH: literal > 12 chars.");                               \
+    uint32_t _pl = (uint32_t)(sizeof(lit)-1);                                  \
+    int _sw = 0;                                                               \
+    if (STR_LEN(s) >= _pl)                                                     \
+        _sw = _tiny_str_memeq(STR_DATA(s), (lit), (long)_pl);                 \
+    _sw;                                                                       \
+})
+
+/* ── slice — pointer-mode view, no alloc ──
+ * Borrows from s. s must outlive the slice.
+ * start >= len → empty string.
+ */
+static inline tiny_str_t STR_SLICE(tiny_str_t s, uint32_t start, uint32_t n) {
+    uint32_t slen = STR_LEN(s);
+    if (start >= slen) return S_PTR("", 0);
+    uint32_t avail = slen - start;
+    uint32_t take  = n < avail ? n : avail;
+    return S_PTR(STR_DATA(s) + start, take);   /* always heap flag → no confusion */
+}
+
+/* ── find byte — repne scasb, returns index or -1 ── */
+static inline long STR_FIND_BYTE(tiny_str_t s, char byte) {
+    uint32_t len = STR_LEN(s);
+    if (!len) return -1L;
+    const char *start = STR_DATA(s);
+    const char *p     = start;
+    long remaining    = (long)len;
+    asm volatile(
+        "cld\n"
+        "repne scasb"
+        : "+D"(p), "+c"(remaining)
+        : "a"((int)(unsigned char)byte)
+        : "memory");
+    /* repne scasb stops AFTER the matching byte (rdi points one past).
+     * remaining was decremented once extra after match.
+     * Not found: remaining reaches 0 with ZF clear.
+     * Use sete on ZF to detect match cleanly. */
+    int found;
+    asm volatile("sete %b0" : "=r"(found) :: "cc");
+    if (!found) return -1L;
+    /* p now points one past the match; subtract start to get index */
+    return (long)(p - start) - 1L;
+}
+
+/* ── I/O ── */
+#define STR_PRINT(s)   _WRITE_IMPL(STR_DATA(s), STR_LEN(s))
+#define STR_PRINTLN(s) ({                                                      \
+    _WRITE_IMPL(STR_DATA(s), STR_LEN(s));                                      \
+    char _nl = '\n'; _WRITE_IMPL(&_nl, 1);                                     \
+})
