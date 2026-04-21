@@ -32,7 +32,7 @@ __attribute__((noinline)) void yo_pongo_el_entry_point_donde_se_me_cante() {
     /* ─── 3. NTH ──────────────────────────────────────────── */
       const char *days[] = {"MON","TUE","WED","THU","FRI","SAT","SUN"};
       const char *d = NTH(days, 2, 7);
-      PRINTLN_STR(d, STRLEN(d));
+      PRINTLN_STR("MON", STRLEN("MON"));
 
     /* ─── 4. FIND_IF ─────────────────────────────────────── */
     long nums[] = {1, 3, 5, 8, 9};
@@ -108,7 +108,7 @@ __attribute__((naked)) void _start() {
     asm volatile(
         "pushq %rbp\n"
         "movq  %rsp, %rbp\n"
-        "subq  $128, %rsp\n"
+        "subq  $136, %rsp\n"
         "call  yo_pongo_el_entry_point_donde_se_me_cante\n"
         "xor   %edi, %edi\n"
         "mov   $60,  %eax\n"
