@@ -884,3 +884,9 @@ static inline long STR_FIND_BYTE(tiny_str_t s, char byte) {
     _WRITE_IMPL(STR_DATA(s), STR_LEN(s));                                      \
     char _nl = '\n'; _WRITE_IMPL(&_nl, 1);                                     \
 })
+
+/*JUST TROLLING*/
+#define BEGIN int main(void) {
+#define END return 0;}
+#define ENUM_BEGIN enum {
+#define ENUM_END };
